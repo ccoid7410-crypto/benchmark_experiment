@@ -24,7 +24,7 @@ SAVED_MAPS_DIR = "saved_maps"
 
 DEFAULT_SYMBOL_SPACE_PROMPT = NO_NUMERIC_SYMBOL_SPACE_PROMPT
 
-PROVIDERS = ["openai", "gemini", "ollama", "llamacpp", "custom"]
+PROVIDERS = ["openai", "gemini", "ollama", "llamacpp", "openrouter", "custom"]
 
 
 def default_base_url_for_provider(provider):

@@ -66,7 +66,7 @@ Keep candidate_keywords to the terms that are actually useful for explaining thi
                     if hasattr(resp, "usage") and resp.usage:
                         usage_record = agent._record_token_usage(resp.usage, source="success_debrief_discussion")
                     raw_text_full = resp.choices[0].message.content.strip()
-                    provider_reasoning = str(getattr(resp.choices[0].message, "reasoning_content", "") or "").strip()
+                    provider_reasoning = extract_provider_reasoning(resp.choices[0].message)
                     inline_reasoning, text = extract_reasoning_and_answer(raw_text_full)
                     if hasattr(self, "log_llm_io"):
                         self.log_llm_io({
@@ -132,7 +132,7 @@ JSON shape:
                 if hasattr(resp, "usage") and resp.usage:
                     usage_record = synthesis_agent._record_token_usage(resp.usage, source="success_debrief_keywords")
                 raw_text_full = resp.choices[0].message.content.strip()
-                provider_reasoning = str(getattr(resp.choices[0].message, "reasoning_content", "") or "").strip()
+                provider_reasoning = extract_provider_reasoning(resp.choices[0].message)
                 inline_reasoning, cleaned_text = extract_reasoning_and_answer(raw_text_full)
                 if hasattr(self, "log_llm_io"):
                     self.log_llm_io({

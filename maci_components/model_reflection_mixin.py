@@ -76,7 +76,7 @@ Keep message and lessons concrete: mention movement, switch/gate timing, frontie
                     if hasattr(resp, "usage") and resp.usage:
                         usage_record = agent._record_token_usage(resp.usage, source="reflection_consultation")
                     raw_text_full = resp.choices[0].message.content.strip()
-                    provider_reasoning = str(getattr(resp.choices[0].message, "reasoning_content", "") or "").strip()
+                    provider_reasoning = extract_provider_reasoning(resp.choices[0].message)
                     inline_reasoning, raw_text = extract_reasoning_and_answer(raw_text_full)
                     reasoning_content = "\n\n".join(part for part in [provider_reasoning, inline_reasoning] if part)
                     if hasattr(self, "log_llm_io"):
@@ -173,7 +173,7 @@ Rules:
             if hasattr(resp, "usage") and resp.usage:
                 usage_record = synthesis_agent._record_token_usage(resp.usage, source="reflection_synthesis")
             raw_text_full = resp.choices[0].message.content.strip()
-            provider_reasoning = str(getattr(resp.choices[0].message, "reasoning_content", "") or "").strip()
+            provider_reasoning = extract_provider_reasoning(resp.choices[0].message)
             inline_reasoning, raw_text = extract_reasoning_and_answer(raw_text_full)
             reasoning_content = "\n\n".join(part for part in [provider_reasoning, inline_reasoning] if part)
             if hasattr(self, "log_llm_io"):

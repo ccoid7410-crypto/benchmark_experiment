@@ -1,6 +1,6 @@
 import os
 import mesa
-from openai import OpenAI
+from openai import OpenAI, APIStatusError
 import json
 import random
 import re
@@ -15,6 +15,7 @@ PROVIDER_DEFAULT_BASE_URLS = {
     "ollama": "http://localhost:11434/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "llamacpp": "http://localhost:8080/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
 }
 
 # Local/self-hosted OpenAI-compatible servers (llama.cpp, Ollama, arbitrary
@@ -61,6 +62,49 @@ def extract_reasoning_and_answer(raw_text):
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     reasoning = "\n\n".join(part.strip() for part in reasoning_parts if part.strip())
     return reasoning, cleaned
+
+
+CONTEXT_OVERFLOW_MARKERS = (
+    "exceed_context_size_error",
+    "context size",
+    "exceeds the available context",
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def is_context_overflow_error(exc) -> bool:
+    """True if `exc` looks like a 'prompt too long for this model's context
+    window' error, across the different wordings local servers (llama.cpp)
+    and hosted routers (OpenRouter/OpenAI) use for it. Distinguishing this
+    from other errors matters because retrying the identical oversized
+    request just fails the same way again - the caller needs to shrink the
+    prompt first."""
+    if not isinstance(exc, APIStatusError):
+        return False
+    if getattr(exc, "status_code", None) not in (400, 413):
+        return False
+    return any(marker in str(exc).lower() for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+def extract_provider_reasoning(message) -> str:
+    """Pulls whatever reasoning text a non-streaming response message carries,
+    in whichever shape the provider uses: a plain `reasoning_content` or
+    `reasoning` string, or `reasoning_details` - a list of blocks each
+    carrying a "text" field (OpenRouter's shape for some models).
+    """
+    piece = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    if piece:
+        return str(piece).strip()
+    details = getattr(message, "reasoning_details", None) or []
+    parts = []
+    for item in details:
+        text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
 NO_NUMERIC_SYMBOL_SPACE_PROMPT = """Communication mode:
 - Coded communication is enabled, but numeric suffixes are disabled.
 - Use only base codes: F, S, G, K, D, H, X, N.

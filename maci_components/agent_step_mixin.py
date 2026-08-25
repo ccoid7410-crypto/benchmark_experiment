@@ -196,12 +196,19 @@ class AgentStepMixin:
             if len(pairs) > MAX_TURNS * 2:
                 pairs = pairs[-(MAX_TURNS * 2):]
 
-            current_call = [self.messages[0]] + pairs + [{"role": "user", "content": user_prompt}]
+            # Shrinks (dropping the oldest turns first) only if the model's
+            # context window turns out to be too small for the full history -
+            # see the context-overflow branch below. Kept outside the retry
+            # loop so a shrink from one attempt carries into the next instead
+            # of every attempt resending the identical oversized prompt.
+            history_limit = len(pairs)
 
             raw_answer = ""
             raw_answer_full = ""
             reasoning_content = ""
             for attempt in range(3):
+                history_slice = pairs[-history_limit:] if history_limit > 0 else []
+                current_call = [self.messages[0]] + history_slice + [{"role": "user", "content": user_prompt}]
                 try:
                     kwargs = {
                         "model": self.model_name,
@@ -215,7 +222,7 @@ class AgentStepMixin:
                     response = self.llm_client.chat.completions.create(**kwargs)
                     message = response.choices[0].message
                     raw_answer_full = (message.content or "").strip()
-                    provider_reasoning = str(getattr(message, "reasoning_content", "") or getattr(message, "reasoning", "") or "").strip()
+                    provider_reasoning = extract_provider_reasoning(message)
 
                     usage_record = {}
                     if hasattr(response, 'usage') and response.usage:
@@ -250,6 +257,14 @@ class AgentStepMixin:
                         print(f"> [Agent {self.unique_id}] [WARNING] Empty response. Retrying... ({attempt + 1}/3)")
 
                 except Exception as e:
+                    # Don't shrink-and-continue on the last attempt - that would
+                    # `continue` straight past the fallback below and leave
+                    # raw_answer empty, silently skipping the agent's turn
+                    # instead of taking the graceful fallback action.
+                    if is_context_overflow_error(e) and history_limit > 0 and attempt < 2:
+                        history_limit = max(0, history_limit - 2)  # drop the oldest user/assistant turn
+                        print(f"> [Agent {self.unique_id}] [WARNING] Prompt too long for the model's context window; dropping older turns (keeping last {history_limit}) and retrying...")
+                        continue
                     print(f"> [Agent {self.unique_id}] Communication Error: {e}")
                     if attempt == 2:
                         raw_answer = '{"reason": "API Error", "action": "UP", "memory": "Error"}'

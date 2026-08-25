@@ -56,8 +56,8 @@ def get_simulation_setup(args):
     console.print("\n[bold cyan]--- Simulation Configuration ---[/bold cyan]")
     
     # 0. Get Provider and API Key
-    provider = input("Select Provider (openai / gemini / ollama / llamacpp / custom) [Default: openai]: ").strip().lower()
-    if provider not in ["openai", "gemini", "ollama", "llamacpp", "custom"]:
+    provider = input("Select Provider (openai / gemini / ollama / llamacpp / openrouter / custom) [Default: openai]: ").strip().lower()
+    if provider not in ["openai", "gemini", "ollama", "llamacpp", "openrouter", "custom"]:
         provider = "openai"
 
     api_key = input(f"Enter {provider.upper()} API Key (Press Enter to use <PROVIDER>_API_KEY / OPENAI_API_KEY env var): ").strip()
@@ -65,6 +65,7 @@ def get_simulation_setup(args):
     default_base_url = {
         "ollama": "http://localhost:11434/v1",
         "llamacpp": "http://localhost:8080/v1",
+        "openrouter": "https://openrouter.ai/api/v1",
     }.get(provider)
     base_url_hint = default_base_url or ("required for 'custom'" if provider == "custom" else "skip")
     base_url = input(f"Enter Custom Base URL for OpenAI compatible endpoint (Default: {base_url_hint}): ").strip()

@@ -1,4 +1,6 @@
 # Local run state - never commit API keys or run artifacts
+key.txt
+hf_key.txt
 last_config.json
 logs/
 experiment_runs/
