@@ -1,0 +1,13 @@
+# Local run state - never commit API keys or run artifacts
+last_config.json
+logs/
+experiment_runs/
+llm_io.jsonl
+prompt_debug.log
+log_*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

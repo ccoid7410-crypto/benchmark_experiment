@@ -1,0 +1,6 @@
+# Project MACI — cooperative LLM benchmark
+# GUI is Tkinter (ships with Python on Windows) - no separate GUI package needed.
+mesa>=3.0
+openai>=1.0
+pillow
+rich
