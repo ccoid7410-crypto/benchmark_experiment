@@ -46,19 +46,11 @@ class MACI_Model(
             os.path.join(os.path.dirname(log_file), "llm_io.jsonl") if log_file and os.path.dirname(log_file)
             else "llm_io.jsonl"
         )
-        self.coded_communication = bool(
-            next((cfg.get("coded_communication") for cfg in agent_configs if "coded_communication" in cfg), True)
-        )
         self.communication_log = []
         self.communication_improvements = []
         self.current_communication_guideline = ""
         self.strategy_improvements = []
         self.reflection_consultations = []
-        self.allowed_broadcast_codes = parse_broadcast_codes(
-            next((cfg.get("allowed_broadcast_codes") for cfg in agent_configs if cfg.get("allowed_broadcast_codes")), "")
-        )
-        if "N" not in self.allowed_broadcast_codes:
-            self.allowed_broadcast_codes.append("N")
         self.success_debrief_done = False
         self.success_debrief = {
             "discussion": [],

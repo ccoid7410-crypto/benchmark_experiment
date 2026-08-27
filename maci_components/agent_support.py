@@ -1,10 +1,24 @@
 import os
+import sys
 import mesa
-from openai import OpenAI, APIStatusError
+from openai import OpenAI, APIStatusError, APIConnectionError
 import json
 import random
 import re
+import time
 import datetime
+
+# Model output can contain arbitrary Unicode (math symbols, emoji, etc.), and
+# on Windows the console's default codepage (e.g. cp949) often can't encode
+# it - printing such text would otherwise crash mid-turn with a
+# UnicodeEncodeError. Reconfigure stdout/stderr to UTF-8 once, defensively,
+# since every entry point (gui_app.py, maci.py, maci_judge.py) imports this
+# module early.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 DEFAULT_BROADCAST_CODES = ["F", "S", "G", "K", "D", "H", "X", "N"]
 
@@ -105,6 +119,44 @@ def extract_provider_reasoning(message) -> str:
     return "".join(parts).strip()
 
 
+def with_retry(fn, *args, retries=3, delay=2.0, **kwargs):
+    """Retry on transient network/5xx/429 errors. 4xx errors other than 429
+    (e.g. a too-long prompt) are deterministic - retrying the identical
+    request just fails the same way again, so those are raised immediately
+    instead of wasting the retry budget."""
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except APIStatusError as e:
+            status = getattr(e, "status_code", None)
+            if status is not None and status < 500 and status != 429:
+                raise
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+        except APIConnectionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
+def extract_reasoning_delta(delta) -> str:
+    """Streaming counterpart to extract_provider_reasoning(): pulls whatever
+    reasoning text a single streamed delta carries, in whichever shape the
+    provider uses (plain `reasoning` string, or `reasoning_details` - a list
+    of blocks each carrying a "text" field)."""
+    piece = getattr(delta, "reasoning", None)
+    if piece:
+        return piece
+    details = getattr(delta, "reasoning_details", None) or []
+    parts = []
+    for item in details:
+        text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
 NO_NUMERIC_SYMBOL_SPACE_PROMPT = """Communication mode:
 - Coded communication is enabled, but numeric suffixes are disabled.
 - Use only base codes: F, S, G, K, D, H, X, N.
@@ -189,116 +241,131 @@ def merge_token_usage(target, addition):
 DEFAULT_PROMPT_TEMPLATES = {
     "gpt": """
 <role>
-You are Agent {agent_id}, a cooperative maze-running agent in Project MACI.
-Your goal is to reach the exit symbol 'F' in as few turns and tokens as possible while coordinating through compact symbolic broadcasts.
+You are Agent {agent_id}, a cooperative maze-running agent in Project MACI. Speak and act decisively.
 </role>
-
-<output_contract>
-Reply ONLY with one valid JSON object. No markdown, no prose outside JSON.
-Required keys:
-- "reason": concise tactical rationale, 1-3 sentences. Do not expose hidden chain-of-thought.
-- "action": one of "UP", "DOWN", "LEFT", "RIGHT".
-- "blocks": integer from 1 to {speed_limit}.
-- "broadcast_message": one base code only, no numeric suffix. Valid: F/S/G/K/D/H/X/N.
-- "notes": short memory update for the next turn.
-- "structured_memory": compact memory update; communication_space may define base-code meanings.
-</output_contract>
 """,
     "gemini": """
 <role>
 You are a cooperative maze-running agent in Project MACI.
-You control exactly one agent: Agent {agent_id}.
-Your goal is to reach the exit F efficiently while coordinating with partner agents under limited communication.
+You control exactly one agent: Agent {agent_id}. Coordinate with your partner agent(s) when it actually helps.
 </role>
-
-<task>
-At each turn, inspect the provided map, memory, interaction rules, inbox messages, and recent path.
-Choose exactly one movement action and broadcast a compact base code.
-</task>
-
-<output_contract>
-Return ONLY one valid JSON object. No markdown. No extra prose.
-Required keys:
-{{
-  "reason": "1-3 concise tactical sentences. Do not reveal hidden chain-of-thought.",
-  "action": "UP | DOWN | LEFT | RIGHT",
-  "blocks": integer from 1 to {speed_limit},
-  "broadcast_message": "one of F/S/G/K/D/H/X/N, with no numeric suffix",
-  "notes": "short memory update for next turn",
-  "structured_memory": {{"communication_space": {{}}}}
-}}
-</output_contract>
 """,
     "kimi": """
 You are Agent {agent_id}, a cooperative maze-running agent in Project MACI.
-
-You must act as one grid-world agent. This is tactical navigation with compact communication.
-Be decisive. Keep reasoning short. Preserve and reuse compact communication conventions.
-Do not output anything except the requested JSON object.
-
-Output exactly one JSON object:
-{{
-  "reason": "concise tactical rationale, 1-3 sentences",
-  "action": "UP | DOWN | LEFT | RIGHT",
-  "blocks": 1,
-  "broadcast_message": "N",
-  "notes": "short next-turn memory",
-  "structured_memory": {{"communication_space": {{}}}}
-}}
-
-broadcast_message must be one of F/S/G/K/D/H/X/N with no numeric suffix.
-Valid examples: "N", "S", "H", "G".
-Invalid examples: "", any code with digits, "Switch here".
+You must act as one grid-world agent. Be decisive and concise.
 """
 }
 
 COMMON_PROMPT_APPENDIX = """
+=== GOAL ===
+Reach the exit symbol 'F' in as few turns as possible, cooperating with your
+partner agent(s) only when it actually helps.
+
+=== OUTPUT CONTRACT: SUBMIT CODE VIA TOOL CALL, NOT PLAIN TEXT ===
+You do not act by writing text. The ONLY way to act this turn is to call
+the submit_policy_code tool with a `code` argument that is valid, directly-
+executable Python - plain-text replies are ignored outright, not treated as
+your answer. Your code is checked for valid syntax before it's accepted: if
+it fails to compile, you get the exact error back and must call
+submit_policy_code again with a fix - it costs you a round, not the turn.
+Optionally start the code with a single "# " comment line explaining your
+choice in a few words - that comment is the only place your reasoning is
+shown to the experimenter, so make it count.
+
+This is real Python, not a restricted mini-language - use whatever the
+language gives you to make your decision: if/elif/else, loops, list/dict
+comprehensions, helper variables, sorting with a custom key, string
+formatting, arithmetic, your own local helper function (define it and call
+it - or write a top-level `def decide(state): ...` and it will be called
+automatically), etc. The only things unavailable are imports and file/
+network access (no stdlib modules) - everything else in the language is
+fair game. Whichever style you write, `auto_move()` must actually get
+called by the time your code finishes running.
+
+Before submitting, you may call the test_policy_code tool (up to a few
+times) to dry-run a draft and see what it would actually do - including
+Python errors - without committing to it. Use it to debug, not to explore
+every option; once you're confident, call submit_policy_code with your
+final code.
+
+Your code runs against a `state` object and these functions - nothing else
+is available (no imports, no file/network access):
+  auto_move(direction, blocks=1, until=None)
+                               # REQUIRED, call exactly once by the time your
+                               # code finishes running.
+                               # direction: "UP" | "DOWN" | "LEFT" | "RIGHT"
+                               # blocks: integer 1..state.speed_limit
+                               # until: OPTIONAL - a Python boolean expression
+                               #   as a string, e.g. "state.standing_on == 'S'"
+                               #   or "'F' in state.landmarks". Leave it out
+                               #   for a normal single-turn move (you'll be
+                               #   asked again next turn either way). Give it
+                               #   a condition to keep moving the same
+                               #   direction automatically on later turns,
+                               #   with NO further LLM calls, until either
+                               #   that condition becomes true or you can no
+                               #   longer move that direction - whichever
+                               #   happens first triggers a fresh call back
+                               #   to you with the current state. Use this
+                               #   for "keep going until something relevant
+                               #   happens" instead of re-deciding every
+                               #   single tile - it costs no extra tokens.
+                               #   The expression is re-evaluated fresh each
+                               #   turn against the state at that turn, so
+                               #   only reference state fields, not local
+                               #   variables from this turn's code.
+  broadcast(text)              # OPTIONAL. Call at most once, only when you
+                               # have something worth telling your partner.
+                               # Do not call it just to say nothing useful -
+                               # silence is fine when there is nothing to add.
+                               # Only fires on turns the LLM is actually
+                               # called - not during an auto-move run.
+
+There is no memory API and no persistent notes - your only memory is the
+conversation itself. Each turn you can see your own past turns (the code you
+wrote and what happened) accumulated in context, so refer back to that
+instead of re-storing facts anywhere.
+
+state fields available to your code:
+  state.pos, state.standing_on, state.speed_limit
+  state.neighbors            # {{"UP": "OPEN" | "BLOCKED: ...", ...}}
+  state.frontier_memory      # list of [x, y] known-open tiles worth exploring
+  state.landmarks            # {{"symbol": [x, y]}}
+  state.blocked_pos          # list of [x, y] previously confirmed blocked
+  state.visible_agents       # ["Agent <id> at (x, y)", ...]
+  state.inbox                # list of messages received since your last turn
+  state.inventory            # list of held items (e.g. "Key")
+  state.interaction_rules    # which agents may use which switches/gates
+  state.recent_path          # your last few actions
+  state.coordination_hint    # usually "" - see COORDINATION below
+
 === DECISION PRIORITIES ===
 1. If 'F' is visible or known and reachable, move toward it immediately.
-2. If a useful interactive tile is visible, handle it: stand on 'S' to open 'G', collect 'K' before 'D'.
-3. Otherwise move toward a frontier: a known open tile next to unknown space.
-4. Avoid recent loops, confirmed walls, and blocked positions.
-5. If a shortest known path to a landmark is needed, you may request:
-   {{"tool_call": {{"name": "dijkstra", "target_x": X, "target_y": Y}}}}
-
-=== FRONTIER MEMORY ===
-- Use frontier_memory as your exploration queue.
-- Prefer the nearest frontier that does not repeat the recent path.
-- When blocked, remember that coordinate as blocked and pick another frontier.
-- If no frontier is listed, pick a safe unexplored-looking direction from immediate neighbors.
-
-=== COMMUNICATION CODEBOOK ===
-S = switch-hold. You are on, moving to, or requesting continued control of an active switch.
-G = gate-staging. You are waiting at or blocked by a relevant gate and ready to pass when it opens.
-H = help-signal. You need partner support now, usually switch-hold or continued switch cycling.
-F = finish-confirm. Exit is known/reachable; keep cooperation active until the finisher is through or done.
-K = key-control. Key is visible, collected, or needed for a locked door.
-D = door-block. Locked door is visible or currently blocking progress.
-X = bad-route. Confirmed blocked/dead-end/hazard route.
-N = navigation. No urgent cooperative event; broadcasting exploration/frontier movement status.
-
-=== COMMUNICATION RULES ===
-- broadcast_message must be one standard base code on every turn.
-- Empty broadcast_message is invalid. If no F/S/G/K/D/H/X event is useful, send N.
-- Numeric suffixes are disabled. Bare codes like S, G, H, F, and N are valid.
-- Remember useful base-code meanings in structured_memory.communication_space and reuse them consistently.
-- Broadcast a standard base code every turn. Use F/S/G/K/D/H/X for confirmed related events; otherwise use N for current navigation/frontier status.
-- Interpret inbox codes using the same codebook.
-- If an inbox message includes an old number form, ignore the number and interpret the base code.
-- If you receive H/G/F from a partner near a gate or exit, keep holding/cycling useful S tiles until the partner passes or finishes.
-- If you are blocked by a closed gate near F, broadcast H or G, stage adjacent to that gate, and retry when partner switch support is active.
-- Secret symbols must not conflict with F, S, G, K, D, H, or X.
+2. If a useful interactive tile is visible, handle it: stand on 'S' to open
+   linked 'G', collect 'K' before 'D'.
+3. Otherwise move toward a frontier from state.frontier_memory.
+4. Avoid recent loops, confirmed walls, and state.blocked_pos.
 
 === INTERACTIVE TILES ===
-- 'S' & 'G': Stand on Switch 'S' to open linked Gates 'G'. Gates stay open only while an allowed agent is on a switch.
-- 'K' & 'D': Step on Key 'K' to pick it up. The key holder can pass through Door 'D', consuming one key.
-- Obey Interaction Rules from the current status. Some switches/gates may only work for specific agents.
+- 'S' & 'G': Stand on Switch 'S' to open linked Gates 'G'. Gates stay open
+  only while an allowed agent is on a switch.
+- 'K' & 'D': Step on Key 'K' to pick it up. The key holder can pass through
+  Door 'D', consuming one key.
+- Obey state.interaction_rules - some switches/gates only work for specific agents.
 
-=== COOPERATION KEYWORDS ===
-- switch-hold: The switch agent stays on or cycles within active S tiles to keep linked gates open until the partner passes or finishes.
-- gate-staging: The blocked agent waits adjacent to the target gate so they can pass immediately when the switch opens it.
-- help-signal: H means the agent is blocked by a cooperative gate/obstacle and needs the partner to act or keep acting.
-- finish-confirm: F near a gate means the exit is reachable, but switch support must continue until the finisher is through or done.
+=== COMMUNICATION ===
+Communication is free-form text and optional every turn - there is no fixed
+code list to pick from. Call broadcast(text) when telling your partner
+something would actually change what they do (e.g. "holding the switch,
+go through the gate now"); don't call it otherwise, and don't pad it with
+filler just to say something.
+
+=== COORDINATION ===
+state.coordination_hint is normally empty. If you've been blocked and silent
+for a while, it will contain a short nudge like "you have been blocked for
+N turns without saying anything to your partner - consider whether telling
+them would help." Treat it as a hint, not a command: broadcast only if it
+actually applies, and it is fine to conclude it doesn't and stay silent again.
 
 Legend: ' ': unknown, '.': path, '#': wall, '@': YOU, numbers: other agents, letters: symbols.
 """

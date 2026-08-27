@@ -155,7 +155,6 @@ if __name__ == "__main__":
             "byte_limit": 500,
             "map_share_radius": 0,
             "optimization_mode": optimization_mode,
-            "coded_communication": True
         })
 
     maci_world = MACI_Model(

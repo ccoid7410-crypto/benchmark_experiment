@@ -17,7 +17,7 @@ class AgentMovementMixin:
             return ""
 
         if hasattr(self.model, 'fake_symbols') and self.model.fake_symbols.get(pos) == 'D':
-            if "Key" not in self.structured_memory["inventory"]:
+            if "Key" not in self.inventory:
                 return "BLOCKED: locked door requires key"
             return ""
 

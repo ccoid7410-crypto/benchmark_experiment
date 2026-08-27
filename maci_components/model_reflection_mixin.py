@@ -25,11 +25,9 @@ class ModelReflectionMixin:
                     "tokens": int(getattr(agent, "total_tokens", 0)),
                     "recent_path": list(getattr(agent, "action_history", [])[-16:]),
                     "last_decision": getattr(agent, "last_decision", {}),
-                    "memory": getattr(agent, "memory", ""),
-                    "landmarks": getattr(agent, "structured_memory", {}).get("landmarks", {}),
-                    "blocked_pos": getattr(agent, "structured_memory", {}).get("blocked_pos", []),
-                    "inventory": getattr(agent, "structured_memory", {}).get("inventory", []),
-                    "communication_space": getattr(agent, "structured_memory", {}).get("communication_space", {})
+                    "landmarks": getattr(agent, "landmarks", {}),
+                    "blocked_pos": getattr(agent, "blocked_positions", []),
+                    "inventory": getattr(agent, "inventory", []),
                 }
                 for agent in self.agents
             ]

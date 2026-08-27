@@ -6,16 +6,13 @@ import time
 import pandas as pd
 from openai import OpenAI, APIConnectionError, APIStatusError
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
 def read_secret(env_var: str, filename: str) -> str:
     """Reads a secret from an env var first, falling back to a local file
-    (e.g. key.txt) resolved relative to this script, not the cwd."""
+    (e.g. key.txt) resolved relative to the current working directory."""
     value = os.environ.get(env_var, "").strip()
     if value:
         return value
-    path = os.path.join(filename)
+    path = filename
     try:
         with open(path, encoding="utf-8") as f:
             return f.read().strip()

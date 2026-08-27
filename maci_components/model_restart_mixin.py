@@ -22,8 +22,6 @@ class ModelRestartMixin:
             agent.messages = []
             agent.action_history = []
             agent.is_done = False
-            agent.memory = "Continuing from reflection synthesis."
-            agent.memory_history = []
             agent.known_map = {}
             agent.inbox = []
             agent.total_tokens = 0
@@ -40,16 +38,13 @@ class ModelRestartMixin:
             }
             agent.token_history = []
             agent.turns = 0
-            agent.structured_memory = {
-                "path": [],
-                "landmarks": {},
-                "frontier_memory": [],
-                "blocked_pos": [],
-                "private_codebook": {},
-                "communication_space": {},
-                "symbol_space_notes": agent.symbol_space_prompt,
-                "inventory": []
-            }
+            agent.landmarks = {}
+            agent.frontier_memory = []
+            agent.blocked_positions = []
+            agent.inventory = []
+            agent.turns_since_broadcast = 0
+            agent.consecutive_blocked_turns = 0
+            agent.active_auto_move = None
 
         reusable_positions = (
             len(restart_positions) >= len(agents_to_reset)

@@ -183,20 +183,6 @@ class MaciGuiApp:
         ttk.Checkbutton(mode_row, text="Optimization Mode (self-improvement across sessions)", variable=self.optimization_mode_var).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(mode_row, text="Experiment Mode (Experimental vs Control group)", variable=self.experiment_mode_var).pack(side="left")
 
-        # Communication settings ---------------------------------------------
-        comm = ttk.LabelFrame(body, text="Communication Symbol Space")
-        comm.pack(fill="x", padx=16, pady=8)
-        code_row = ttk.Frame(comm)
-        code_row.pack(fill="x", padx=10, pady=6)
-        ttk.Label(code_row, text="Allowed broadcast codes").pack(side="left")
-        self.broadcast_codes_var = tk.StringVar(value=eio.get_saved_broadcast_codes(cfg))
-        ttk.Entry(code_row, textvariable=self.broadcast_codes_var, width=40).pack(side="left", padx=8)
-
-        ttk.Label(comm, text="Symbol space notes (added to every agent's prompt)").pack(anchor="w", padx=10)
-        self.symbol_space_text = tk.Text(comm, height=5, wrap="word")
-        self.symbol_space_text.pack(fill="x", padx=10, pady=(0, 8))
-        self.symbol_space_text.insert("1.0", eio.get_saved_symbol_space_prompt(cfg))
-
         # Saved maps -----------------------------------------------------
         maps = ttk.LabelFrame(body, text="Saved Map Loader")
         maps.pack(fill="x", padx=16, pady=8)
@@ -275,7 +261,7 @@ class MaciGuiApp:
             ttk.Label(tab, text="Custom system prompt (used when profile = custom)").pack(anchor="w", padx=8)
             custom_prompt_text = tk.Text(tab, height=8, wrap="word")
             custom_prompt_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-            custom_prompt_text.insert("1.0", eio.strip_numeric_suffix_prompt_text(prev.get("custom_system_prompt", ""), include_default=False))
+            custom_prompt_text.insert("1.0", prev.get("custom_system_prompt", ""))
 
             self.agent_widgets.append({
                 "model_var": model_var,
@@ -288,12 +274,10 @@ class MaciGuiApp:
             })
 
     def _collect_agent_configs(self):
-        allowed_codes = self.broadcast_codes_var.get()
-        symbol_space_prompt = eio.strip_numeric_suffix_prompt_text(self.symbol_space_text.get("1.0", "end"), include_default=True)
         configs = []
         for w in self.agent_widgets:
             profile = w["profile_var"].get()
-            custom_prompt = eio.strip_numeric_suffix_prompt_text(w["custom_prompt_text"].get("1.0", "end"), include_default=False)
+            custom_prompt = w["custom_prompt_text"].get("1.0", "end").strip()
             configs.append({
                 "model_name": w["model_var"].get().strip() or "gpt-4o-mini",
                 "vision_range": int(w["vision_var"].get()),
@@ -302,10 +286,7 @@ class MaciGuiApp:
                 "map_share_radius": int(w["share_var"].get()),
                 "prompt_profile": profile,
                 "custom_system_prompt": custom_prompt,
-                "allowed_broadcast_codes": allowed_codes,
-                "symbol_space_prompt": symbol_space_prompt,
                 "optimization_mode": self.optimization_mode_var.get(),
-                "coded_communication": True,
             })
         return configs
 
@@ -335,8 +316,6 @@ class MaciGuiApp:
             "thinking_effort": thinking_effort,
             "optimization_mode": optimization_mode,
             "experiment_mode": experiment_mode,
-            "allowed_broadcast_codes": self.broadcast_codes_var.get(),
-            "symbol_space_prompt": self.symbol_space_text.get("1.0", "end"),
             "agent_configs": agent_configs,
         })
 
@@ -542,10 +521,13 @@ class MaciGuiApp:
         text = (
             f"Turn: {decision.get('turn', 0)}\n"
             f"Action: {decision.get('action', '')}  Blocks: {decision.get('blocks', '')}\n"
-            f"Broadcast: {decision.get('broadcast_message', '')} ({decision.get('broadcast_meaning', '')})\n"
+            f"Broadcast: {decision.get('broadcast_message', '') or '(none)'}\n"
             f"Notes: {decision.get('notes', '')}\n"
             f"{'-'*60}\n"
             f"Reasoning / chain-of-thought:\n{decision.get('reasoning_content', '') or '(none captured for this turn)'}\n"
+            f"{'-'*60}\n"
+            f"Policy code:\n{decision.get('policy_code', '')}\n"
+            f"Policy error: {decision.get('policy_error') or '(none)'}\n"
             f"{'-'*60}\n"
             f"Full raw model response:\n{decision.get('raw_response', '')}\n"
         )

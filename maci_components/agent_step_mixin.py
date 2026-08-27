@@ -1,448 +1,152 @@
-"""Turn execution logic for MACI agents."""
+"""Turn execution logic for MACI agents (Code as Policies).
+
+Each turn, the agent LLM writes a short Python snippet (a policy) that is
+executed in a locked-down subprocess (see policy_executor.py) to produce a
+move/broadcast decision, instead of returning a fixed JSON action. There is
+no explicit memory API - the agent's only "memory" is the accumulating
+conversation history (self.messages) it can see each turn. Before
+committing, the model may call the test_policy_code tool to dry-run drafts
+and see errors/results, up to MAX_TOOL_ROUNDS times.
+
+The policy calls auto_move(direction, blocks=1, until=None) instead of a
+one-shot move(): with no `until`, it behaves like a single-turn action (the
+LLM is asked again next turn) - but with an `until` condition (a boolean
+expression string over `state`), the same direction keeps getting applied
+automatically on later turns, with no LLM call, until that condition
+becomes true or the agent gets blocked - see _run_active_auto_move below.
+"""
 
 from .agent_support import *
+from .policy_executor import run_policy_code, check_condition
+
+POLICY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "test_policy_code",
+        "description": (
+            "Dry-run a draft of your policy code without committing to it, so you "
+            "can debug before submitting your final answer. Returns the resulting "
+            "action/blocks/broadcast/until, or an error if the code raised an exception."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "The Python policy code to test."},
+            },
+            "required": ["code"],
+        },
+    },
+}
+
+SUBMIT_POLICY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_policy_code",
+        "description": (
+            "Submit your final policy code for this turn. This is the ONLY way to "
+            "act - plain text answers are ignored. The code is checked for valid "
+            "Python syntax before it is accepted: if it fails to compile, you get "
+            "the error back and must call this again with a fix (it is NOT run for "
+            "real and does NOT cost you the turn until it compiles)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "The final Python policy code for this turn."},
+            },
+            "required": ["code"],
+        },
+    },
+}
+
+MAX_TOOL_ROUNDS = 4
+MAX_MESSAGE_HISTORY_TURNS = 5
+DIRECTION_DELTAS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+ZERO_TOKEN_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0}
+
+
+def _extract_policy_code(content_text):
+    """Pulls just the policy code out of a model's final answer, even when it
+    ignores the "just code, no prose" instruction - some models wrap the
+    answer in an invented <answer>/<final>/<code> tag, add an explanatory
+    paragraph before it, or use a ```python fence; naively exec()-ing the
+    whole raw text in those cases is a SyntaxError."""
+    text = str(content_text or "").strip()
+
+    tag_match = re.search(
+        r"<(?:answer|final_answer|final|code)>(.*?)</(?:answer|final_answer|final|code)>",
+        text, flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tag_match:
+        text = tag_match.group(1).strip()
+
+    fence_match = re.search(r"```(?:python)?\s*\n?(.*?)```", text, flags=re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1)
+
+    return text.replace("```python", "").replace("```", "").strip()
+
+
+def _check_compiles(code):
+    """Returns None if `code` is valid Python, else a short error string.
+    Catching this before ever running the code means leftover stray prose
+    (that _extract_policy_code couldn't identify as a wrapper) gets fed back
+    to the model as a concrete compile error and retried, instead of being
+    silently discarded as a fallback UP move."""
+    try:
+        compile(code, "<policy>", "exec")
+        return None
+    except SyntaxError as e:
+        return f"{type(e).__name__}: {e}"
 
 
 class AgentStepMixin:
-    def step(self):
-        """
-        The core action loop executed every simulation step.
-        The agent perceives the environment, asks the LLM, and moves.
-        """
-        if self.is_done:
-            return
-
-        self.turns += 1
-        decision_start_pos = self.pos
-        
-        target = getattr(self.model, 'target_pos', (-1,-1))
-        
-        # Check if already on target before making a move
-        if self.pos == target:
-            print(f"\n[FOUND] [Agent {self.unique_id} - {self.model_name}] has found the Target 'F'!!!")
-            self.is_done = True
-            return
-            
-        # Determine what the agent is currently standing on
-        standing_on = self._tile_symbol_at(self.pos) or '.'
-        pre_move_events = self._apply_tile_interactions()
-        if pre_move_events:
-            standing_on = self._tile_symbol_at(self.pos) or '.'
-
-        # --- Map Sharing Processing ---
-        for other in self.model.agents:
-            if other != self and other.map_share_radius > 0:
-                ox, oy = other.pos
-                for (kx, ky), tile in other.known_map.items():
-                    dist = max(abs(kx - ox), abs(ky - oy))
-                    if dist <= other.map_share_radius:
-                        self.known_map[(kx, ky)] = tile
-
-        if not self.messages:
-            system_prompt = self._build_system_prompt()
-            if self.optimization_mode:
-                self._remember_optimization_base_prompt()
-                system_prompt += f"\n[Optimization Mode Active]\nGuidelines: {self.prompt_addition}\n"
-            
-            self.messages.append({"role": "system", "content": system_prompt})
-
-        surroundings, visible_agents = self.get_surroundings()
-        
-        # --- Automated Structured Memory Update ---
-        self.structured_memory["path"] = self.action_history[-20:]
+    def _build_perception_state(self, standing_on, visible_agents, coordination_hint):
         x, y = self.pos
-        
-        # Update landmarks from known_map
-        for (kx, ky), val in self.known_map.items():
-            if val not in ['.', '#', '@', ' '] and not val.isdigit():
-                self.structured_memory["landmarks"][val] = [kx, ky]
-
-        # Track exploration frontiers: known open/symbol tiles adjacent to unknown space.
-        frontier_candidates = []
-        for (kx, ky), val in self.known_map.items():
-            if val == '#':
-                continue
-            if (kx, ky) in self.structured_memory["blocked_pos"]:
-                continue
-            for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
-                neighbor = (kx + dx, ky + dy)
-                if neighbor not in self.known_map:
-                    dist = abs(kx - x) + abs(ky - y)
-                    frontier_candidates.append((dist, kx, ky))
-                    break
-        frontier_candidates.sort()
-        self.structured_memory["frontier_memory"] = [
-            [kx, ky] for _, kx, ky in frontier_candidates[:12]
-        ]
-
-        # Get immediate neighbors
-        neighbor_data = []
-        for name, dx, dy in [("UP (North)", 0, -1), ("DOWN (South)", 0, 1), ("LEFT (West)", -1, 0), ("RIGHT (East)", 1, 0)]:
+        neighbor_status = {}
+        for name, (dx, dy) in DIRECTION_DELTAS.items():
             nx, ny = x + dx, y + dy
             block_reason = self._movement_block_reason((nx, ny))
             if 0 <= nx < self.model.width and 0 <= ny < self.model.height:
-                tile = self.known_map.get((nx, ny), " ")
-                status = "OPEN" if not block_reason else block_reason
-                neighbor_data.append(f"- {name}: '{tile}' -> {status}")
+                neighbor_status[name] = block_reason or "OPEN"
             else:
-                neighbor_data.append(f"- {name}: 'OUT OF BOUNDS' -> {block_reason}")
-        neighbor_str = "\n".join(neighbor_data)
+                neighbor_status[name] = "OUT OF BOUNDS"
 
+        recent_path = self.action_history[-10:] if self.action_history else []
+        other_agent_info = [f"Agent {a.unique_id} at {p}" for a, p in visible_agents]
 
-        ascii_map = self.get_memory_map(visible_agents)
-
-        actions_str = " -> ".join(self.action_history[-10:]) if self.action_history else "Just started"
-        last_move = self.action_history[-1] if self.action_history else "None (Just started)"
-
-        coded_communication = getattr(self.model, "coded_communication", False)
-        allowed_code_class = "".join(re.escape(code) for code in getattr(self.model, "allowed_broadcast_codes", DEFAULT_BROADCAST_CODES))
-        allowed_code_list = "/".join(getattr(self.model, "allowed_broadcast_codes", DEFAULT_BROADCAST_CODES))
-        symbol_space_notes = self.symbol_space_prompt.strip() or "No extra experimenter-defined symbol-space notes."
-        communication_space_str = (
-            json.dumps(self.structured_memory.get("communication_space", {}), ensure_ascii=False)
-            if coded_communication
-            else "Disabled for this run; use natural-language broadcasts."
-        )
-
-        if coded_communication:
-            for inbox_item in self.inbox:
-                for msg_code in re.findall(rf"\b([{allowed_code_class}])(?:10|[0-9])?\b", inbox_item.upper()):
-                    self.structured_memory["communication_space"].setdefault(
-                        msg_code,
-                        f"Received from partner; infer meaning from context."
-                    )
-        inbox_str = "\n".join(self.inbox) if self.inbox else "No messages."
-        self.inbox.clear()
-
-        # Prepare memory history for prompt
-        mem_hist_str = "\n".join([f"- {m}" for m in self.memory_history[-10:]]) if self.memory_history else "No previous memory notes."
-        struct_mem_str = json.dumps(self.structured_memory, indent=2)
-
-
-        # Highlight visible agents in text
-
-        other_agent_info = ""
-        if visible_agents:
-            other_agent_info = "VISIBLE AGENTS NEARBY: " + ", ".join([f"Agent {a.unique_id} at {p}" for a, p in visible_agents])
-        else:
-            other_agent_info = "No other agents currently visible."
-
-        interaction_rules_str = json.dumps(getattr(self.model, "interaction_rules", {}))
-
-        if coded_communication:
-            communication_instruction = (
-                f"Use broadcast_message only for confirmed allowed-code events ({allowed_code_list}). "
-                f"broadcast_message is REQUIRED every turn and MUST be one base code only. Valid: N, S, G, H, F, K, D, X. Invalid: empty messages, codes with digits, or natural-language sentences. "
-                f"If no cooperative event is active, send N to report navigation/frontier status. "
-                f"Numeric suffixes are disabled; do not append numbers to any code. "
-                f"Prefer S when holding switch support, G when staged at a gate, H when requesting partner help, and F when the finish is reachable but support must continue. "
-                f"Always include structured_memory.communication_space. If you send or interpret any base code, add or update that exact key with a short local meaning. "
-            )
-        else:
-            communication_instruction = (
-                "Coded communication is disabled. Do not use numbered compact codes. "
-                "broadcast_message may be an empty string or one short natural-language status for partners. "
-                "Use plain language for switch/gate/exit/help status when it matters. "
-                "structured_memory.communication_space is optional and should not be used for code slots. "
-            )
-
-        user_prompt = (
-            f"=== CURRENT STATUS ===\n"
-            f"Position: {self.pos}\n"
-            f"Standing on: '{standing_on}'\n"
-            f"MOVEMENT RULES:\n"
-            f" - SPEED LIMIT: Up to {self.speed_limit} blocks per turn.\n\n"
-            f"=== IMMEDIATE NEIGHBORS (1-step) ===\n{neighbor_str}\n\n"
-            f"=== DATA & MEMORY ===\n"
-            f"Structured Memory: {json.dumps(self.structured_memory)}\n"
-            f"Frontier Memory: {json.dumps(self.structured_memory['frontier_memory'])}\n"
-            f"Allowed Broadcast Codes: {allowed_code_list}\n"
-            f"Known Communication Space: {communication_space_str}\n"
-            f"Experimenter Symbol Space Notes:\n{symbol_space_notes}\n"
-            f"Interaction Rules: {interaction_rules_str}\n"
-            f"Previous Strategy Notes: {self.memory}\n\n"
-            f"=== PERCEPTION ===\n"
-            f"Partner/Other Info: {other_agent_info}\n"
-            f"Recent Path: {actions_str}\n"
-            f"Inbox: {inbox_str}\n"
-            f"Memory Map (@=YOU):\n{ascii_map}\n\n"
-            f"--- FINAL INSTRUCTION ---\n"
-            f"Choose the best next move now. Return only JSON with keys: "
-            f"'reason', 'action', 'blocks', 'broadcast_message', 'notes', and 'structured_memory'. "
-            f"Do not choose any direction marked BLOCKED in IMMEDIATE NEIGHBORS. Treat BLOCKED directions as unavailable until map/gate/key state changes. "
-            f"Use frontier_memory for exploration when no target/interactive tile is urgent. "
-            f"{communication_instruction}"
-            f"Keep 'reason' concise and tactical; do not include hidden chain-of-thought."
-        )
-
-
-
-
-
-
-        
-        turn_token_usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "reasoning_tokens": 0,
-            "cached_tokens": 0,
-            "total_tokens": 0
+        return {
+            "pos": list(self.pos),
+            "standing_on": standing_on,
+            "speed_limit": self.speed_limit,
+            "neighbors": neighbor_status,
+            "frontier_memory": self.frontier_memory,
+            "landmarks": self.landmarks,
+            "blocked_pos": [list(p) for p in self.blocked_positions],
+            "visible_agents": other_agent_info,
+            "inbox": list(self.inbox),
+            "inventory": list(self.inventory),
+            "interaction_rules": getattr(self.model, "interaction_rules", {}),
+            "recent_path": recent_path,
+            "coordination_hint": coordination_hint,
         }
 
-        while True:
-            MAX_TURNS = 5
-            pairs = self.messages[1:]
-
-            if len(pairs) > MAX_TURNS * 2:
-                pairs = pairs[-(MAX_TURNS * 2):]
-
-            # Shrinks (dropping the oldest turns first) only if the model's
-            # context window turns out to be too small for the full history -
-            # see the context-overflow branch below. Kept outside the retry
-            # loop so a shrink from one attempt carries into the next instead
-            # of every attempt resending the identical oversized prompt.
-            history_limit = len(pairs)
-
-            raw_answer = ""
-            raw_answer_full = ""
-            reasoning_content = ""
-            for attempt in range(3):
-                history_slice = pairs[-history_limit:] if history_limit > 0 else []
-                current_call = [self.messages[0]] + history_slice + [{"role": "user", "content": user_prompt}]
-                try:
-                    kwargs = {
-                        "model": self.model_name,
-                        "messages": current_call,
-                    }
-                    if getattr(self.model, "json_response_format_supported", True):
-                        kwargs["response_format"] = {"type": "json_object"}
-                    if getattr(self.model, "reasoning_effort_supported", True) and self.thinking_effort in ["low", "medium", "high"]:
-                        kwargs["reasoning_effort"] = self.thinking_effort
-
-                    response = self.llm_client.chat.completions.create(**kwargs)
-                    message = response.choices[0].message
-                    raw_answer_full = (message.content or "").strip()
-                    provider_reasoning = extract_provider_reasoning(message)
-
-                    usage_record = {}
-                    if hasattr(response, 'usage') and response.usage:
-                        usage_record = self._record_token_usage(response.usage, source="turn")
-                        merge_token_usage(turn_token_usage, usage_record)
-
-                    if raw_answer_full:
-                        inline_reasoning, cleaned_answer = extract_reasoning_and_answer(raw_answer_full)
-                        reasoning_content = "\n\n".join(part for part in [provider_reasoning, inline_reasoning] if part)
-                        raw_answer = cleaned_answer.replace("```json", "").replace("```", "").strip()
-
-                        if hasattr(self.model, "log_llm_io"):
-                            self.model.log_llm_io({
-                                "agent": self.model._agent_label(self) if hasattr(self.model, "_agent_label") else str(self.unique_id),
-                                "agent_id": str(self.unique_id),
-                                "model": self.model_name,
-                                "provider": getattr(self.model, "provider", ""),
-                                "turn": self.turns,
-                                "attempt": attempt + 1,
-                                "messages_sent": current_call,
-                                "raw_response": raw_answer_full,
-                                "reasoning_content": reasoning_content,
-                                "cleaned_response": raw_answer,
-                                "token_usage": usage_record,
-                            })
-
-                        if raw_answer:
-                            break
-                        else:
-                            print(f"> [Agent {self.unique_id}] [WARNING] Empty response after removing reasoning tags. Retrying... ({attempt + 1}/3)")
-                    else:
-                        print(f"> [Agent {self.unique_id}] [WARNING] Empty response. Retrying... ({attempt + 1}/3)")
-
-                except Exception as e:
-                    # Don't shrink-and-continue on the last attempt - that would
-                    # `continue` straight past the fallback below and leave
-                    # raw_answer empty, silently skipping the agent's turn
-                    # instead of taking the graceful fallback action.
-                    if is_context_overflow_error(e) and history_limit > 0 and attempt < 2:
-                        history_limit = max(0, history_limit - 2)  # drop the oldest user/assistant turn
-                        print(f"> [Agent {self.unique_id}] [WARNING] Prompt too long for the model's context window; dropping older turns (keeping last {history_limit}) and retrying...")
-                        continue
-                    print(f"> [Agent {self.unique_id}] Communication Error: {e}")
-                    if attempt == 2:
-                        raw_answer = '{"reason": "API Error", "action": "UP", "memory": "Error"}'
-                        raw_answer_full = raw_answer_full or raw_answer
-
-            if not raw_answer:
-                return
-
-            action = "UNKNOWN"
-            reason = "No reason provided"
-            new_notes = ""
-            new_msg = ""
-            message_meaning = ""
-            parsed_data = {}
-
-            try:
-                # Find outermost braces to handle nested JSON
-                first_brace = raw_answer.find('{')
-                last_brace = raw_answer.rfind('}')
-                if first_brace != -1 and last_brace != -1:
-                    clean_answer = raw_answer[first_brace:last_brace+1]
-                else:
-                    clean_answer = raw_answer
-                
-                parsed_data = json.loads(clean_answer)
-
-
-                if "tool_call" in parsed_data:
-                    tool_call = parsed_data["tool_call"]
-                    if tool_call.get("name") == "dijkstra":
-                        target_x = tool_call.get("target_x")
-                        target_y = tool_call.get("target_y")
-                        if target_x is not None and target_y is not None:
-                            try:
-                                target_coord = (int(target_x), int(target_y))
-                            except ValueError:
-                                target_coord = self.pos # Fallback if not integers
-                                
-                            tool_result = self._run_dijkstra_tool(target_coord)
-                            
-                            print(f"> [Agent {self.unique_id} ({self.model_name})] [TOOL] Used Tool Dijkstra to search for {target_coord}. Result: {tool_result}")
-                            
-                            # Add interaction to messages
-                            self.messages.append({"role": "user", "content": user_prompt})
-                            self.messages.append({"role": "assistant", "content": clean_answer})
-                            
-                            # Set new prompt for the second pass
-                            user_prompt = (
-                                f"Tool Result for Dijkstra {target_coord}: {tool_result}\n"
-                                f"Now provide the final JSON with keys: 'reason', 'action', "
-                                f"'blocks', 'broadcast_message', 'notes', and 'structured_memory'. "
-                                f"{communication_instruction}"
-                                f"Keep 'reason' concise."
-                            )
-                            continue # Loop again to get action
-
-                action = parsed_data.get("action", "UNKNOWN").upper()
-                reason = parsed_data.get("reason", "No reason provided")
-                new_notes = parsed_data.get("notes", "")
-                new_msg = self._normalize_broadcast_message(parsed_data.get("broadcast_message", ""))
-                memory_update = parsed_data.get("structured_memory", {})
-                if isinstance(memory_update, dict):
-                    private_codebook = memory_update.get("private_codebook")
-                    if isinstance(private_codebook, dict):
-                        reserved_codes = set(getattr(self.model, "allowed_broadcast_codes", DEFAULT_BROADCAST_CODES))
-                        for code, meaning in private_codebook.items():
-                            code = str(code).strip()[:1]
-                            if code and code not in reserved_codes:
-                                self.structured_memory["private_codebook"][code] = str(meaning)[:80]
-                    communication_space = memory_update.get("communication_space")
-                    if coded_communication and isinstance(communication_space, dict):
-                        for code, meaning in communication_space.items():
-                            normalized_code = self._normalize_broadcast_message(code)
-                            if normalized_code:
-                                self.structured_memory["communication_space"][normalized_code] = str(meaning)[:100]
-
-                self.memory = new_notes
-                self.memory_history.append(new_notes)
-                # Keep all history, do not pop.
-
-
-
-
-                log_msg = f"\n--- [Agent {self.unique_id} Turn] ---\n"
-                log_msg += f"Model: {self.model_name}\n"
-                log_msg += f"Position: {self.pos}\n"
-                log_msg += f"Reasoning: {reason}\n"
-                log_msg += f"Action: {action}\n"
-                log_msg += f"Token Usage: {json.dumps(turn_token_usage)}\n"
-                log_msg += f"Memory (Notes): {new_notes}\n"
-                log_msg += f"Structured Memory: {json.dumps(self.structured_memory)}\n"
-                if new_msg:
-                    log_msg += f"Broadcast: {new_msg}\n"
-                self.model.log(log_msg)
-
-                if new_msg:
-                    if coded_communication:
-                        # Symbolic communication: standard code plus optional numeric slot.
-                        if re.match(r"^[A-Z]$", new_msg) and new_msg not in self.structured_memory["communication_space"]:
-                            self.structured_memory["communication_space"][new_msg] = (
-                                f"Base symbol used from context: {new_notes or reason}"
-                            )
-                        self.structured_memory["communication_space"].setdefault(
-                            new_msg,
-                            f"Sent from context: {new_notes or reason}"
-                        )
-                        message_meaning = self.structured_memory["communication_space"].get(new_msg, "")
-                    else:
-                        message_meaning = new_msg
-                    sender_label = self.model._agent_label(self) if hasattr(self.model, "_agent_label") else str(self.unique_id)
-                    recipients = []
-                    for other in self.model.agents:
-                        if other != self:
-                            other_label = self.model._agent_label(other) if hasattr(self.model, "_agent_label") else str(other.unique_id)
-                            recipients.append(other_label)
-                            other.inbox.append(f"Agent {sender_label}: {new_msg}")
-                    if hasattr(self.model, "communication_log"):
-                        self.model.communication_log.append({
-                            "model_step": len(self.model.communication_log) + 1,
-                            "agent_turn": self.turns,
-                            "from": sender_label,
-                            "to": recipients,
-                            "message": new_msg,
-                            "meaning": message_meaning,
-                            "position": list(self.pos),
-                            "reason": reason,
-                            "notes": new_notes
-                        })
-                else:
-                    message_meaning = ""
-
-
-            except json.JSONDecodeError:
-                found_actions = re.findall(r"\b(UP|DOWN|LEFT|RIGHT|NORTH|SOUTH|EAST|WEST)\b", raw_answer.upper())
-                found_reasons = re.findall(r'"reason":\s*"(.*?)"', raw_answer)
-                if found_actions:
-                    action = found_actions[-1]
-                    reason = found_reasons[-1] if found_reasons else "Extracted via Regex Fallback"
-                else:
-                    action = "UP"
-                    reason = "Fallback"
-                    
-            if action == "NORTH": action = "UP"
-            elif action == "SOUTH": action = "DOWN"
-            elif action == "WEST": action = "LEFT"
-            elif action == "EAST": action = "RIGHT"
-
-            break # Exit loop when valid action is parsed
-
-        print(f"\n>>> Model Step: Agent {self.unique_id} ({self.model_name})")
-        if new_msg:
-            print(f"[BROADCAST]: \"{new_msg}\"")
-        print(f"[POS] Position: {self.pos}")
-        print(f"[THINK] Reasoning: {reason}")
-        print(f"[ACTION] Action: {action}")
-        print(f"[MEMO] Notes: {new_notes}")
-
-        print("-" * 30)
-
-        self.messages.append({"role": "user", "content": user_prompt})
-
-
-        self.messages.append({"role": "assistant", "content": raw_answer})
-
+    def _apply_movement(self, action, blocks, decision_start_pos):
+        """Applies one move (already decided, by the LLM or an active
+        auto-move plan) and updates blocked-position tracking. Returns
+        (interaction_events, blocked_feedback)."""
         x, y = self.pos
         new_pos = self.pos
-        # Multi-block movement logic
-        try:
-            blocks = int(parsed_data.get("blocks", 1))
-        except:
-            blocks = 1
-        blocks = max(1, min(blocks, self.speed_limit))
 
-        dx, dy = 0, 0
-        if action == "UP": dy = -1
-        elif action == "DOWN": dy = 1
-        elif action == "LEFT": dx = -1
-        elif action == "RIGHT": dx = 1
+        if action not in DIRECTION_DELTAS:
+            # No usable decision this turn (invalid/failed policy code) -
+            # stay put. Distinct from a real BLOCKED direction: nothing was
+            # actually chosen, so it shouldn't count against the "stuck at
+            # a wall" nudge tracking.
+            self.action_history.append("No-op (no valid decision this turn)")
+            return [], ""
+
+        dx, dy = DIRECTION_DELTAS[action]
 
         blocked_feedback = ""
         blocked_coords = None
@@ -462,53 +166,523 @@ class AgentStepMixin:
         if new_pos != self.pos:
             self.model.grid.move_agent(self, new_pos)
             self.action_history.append(f"{action} x{blocks}")
-            
             interaction_events = self._apply_tile_interactions()
-
-            # Clear blocked list if we successfully moved
-            if self.pos in self.structured_memory["blocked_pos"]:
-                self.structured_memory["blocked_pos"].remove(self.pos)
+            self.consecutive_blocked_turns = 0
+            if self.pos in self.blocked_positions:
+                self.blocked_positions.remove(self.pos)
         else:
             interaction_events = []
-            if blocked_coords is None:
-                if action == "UP": blocked_coords = (x, y - 1)
-                elif action == "DOWN": blocked_coords = (x, y + 1)
-                elif action == "LEFT": blocked_coords = (x - 1, y)
-                elif action == "RIGHT": blocked_coords = (x + 1, y)
-                if blocked_coords is not None:
-                    blocked_reason = self._movement_block_reason(blocked_coords)
+            self.consecutive_blocked_turns += 1
+            if blocked_coords is None and (dx != 0 or dy != 0):
+                blocked_coords = (x + dx, y + dy)
+                blocked_reason = self._movement_block_reason(blocked_coords)
             blocked_reason = blocked_reason or "BLOCKED: unavailable move"
             self.action_history.append(f"Tried {action}(Blocked)")
-            block_coords = None
-            if action == "UP": block_coords = (x, y - 1)
-            elif action == "DOWN": block_coords = (x, y + 1)
-            elif action == "LEFT": block_coords = (x - 1, y)
-            elif action == "RIGHT": block_coords = (x + 1, y)
-            
-            if block_coords and block_coords not in self.structured_memory["blocked_pos"]:
-                self.structured_memory["blocked_pos"].append(block_coords)
-                # Keep only last 10 blocked spots to save space
-                if len(self.structured_memory["blocked_pos"]) > 10:
-                    self.structured_memory["blocked_pos"].pop(0)
+
+            if blocked_coords and blocked_coords not in self.blocked_positions:
+                self.blocked_positions.append(blocked_coords)
+                if len(self.blocked_positions) > 10:
+                    self.blocked_positions.pop(0)
             if blocked_coords is not None:
                 blocked_feedback = (
                     f"BLOCKED FEEDBACK: {action} is unavailable from {decision_start_pos} "
                     f"toward {blocked_coords}: {blocked_reason}. Choose another OPEN direction next turn."
                 )
-                self.memory = blocked_feedback
-                self.memory_history.append(blocked_feedback)
                 self.model.log(f"> [Agent {self.unique_id}] {blocked_feedback}")
+
+        return interaction_events, blocked_feedback
+
+    def _run_active_auto_move(self, agent_label, decision_start_pos, standing_on, visible_agents, pre_move_events):
+        """Tries to keep an already-submitted auto_move() plan running without
+        calling the LLM. Returns True if it handled this turn (caller should
+        return), or False if the plan ended (blocked, condition true/errored,
+        or no plan) and a normal LLM turn should run instead."""
+        plan = self.active_auto_move
+        if not plan:
+            return False
+
+        direction = plan["direction"]
+        blocks = plan["blocks"]
+        until_expr = plan.get("until")
+        dx, dy = DIRECTION_DELTAS.get(direction, (0, 0))
+        target_pos = (self.pos[0] + dx, self.pos[1] + dy)
+        block_reason = self._movement_block_reason(target_pos)
+
+        condition_triggered = False
+        if not block_reason and until_expr:
+            condition_state = self._build_perception_state(standing_on, visible_agents, "")
+            cond = check_condition(until_expr, condition_state, timeout=5)
+            if cond.get("error"):
+                print(f"> [Agent {agent_label}] [WARNING] auto-move condition errored ({cond['error']}); calling LLM back.")
+                condition_triggered = True
+            elif cond.get("result"):
+                condition_triggered = True
+
+        if block_reason or condition_triggered:
+            why = block_reason or "condition met"
+            print(f"> [Agent {agent_label}] auto-move plan ended ({why}); calling the LLM back.")
+            self.model.log(f"> [Agent {self.unique_id}] auto-move plan ended ({why}); calling the LLM back.")
+            self.active_auto_move = None
+            return False
+
+        interaction_events, blocked_feedback = self._apply_movement(direction, blocks, decision_start_pos)
+        print(f"> [Agent {agent_label}] auto-move {direction} x{blocks} (plan continues, no LLM call)")
+        self.turns_since_broadcast += 1
+
+        self.last_decision = {
+            "turn": self.turns,
+            "reason": f"(auto-move: continuing {direction} until '{until_expr}')",
+            "action": direction,
+            "blocks": blocks,
+            "notes": "",
+            "broadcast_message": "",
+            "broadcast_meaning": "",
+            "raw_response": "",
+            "reasoning_content": "",
+            "policy_code": f"# auto-move plan active - no LLM call this turn\nauto_move({direction!r}, {blocks}, until={until_expr!r})",
+            "policy_error": None,
+            "auto_move": True,
+            "token_usage": dict(ZERO_TOKEN_USAGE),
+            "cumulative_token_usage": {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "reasoning_tokens": self.reasoning_tokens,
+                "cached_tokens": self.cached_tokens,
+                "total_tokens": self.total_tokens,
+            },
+            "start_position": list(decision_start_pos),
+            "end_position": list(self.pos),
+            "blocked": self.pos == decision_start_pos,
+            "blocked_reason": blocked_feedback,
+            "interactions": pre_move_events + interaction_events,
+            "inventory": list(self.inventory),
+        }
+        return True
+
+    def _run_policy_plain_loop(self, working_messages, state, turn_token_usage, agent_label):
+        """Fallback for providers that don't reliably support OpenAI-style tool
+        calling (RELAXED_API_PROVIDERS - typically local llama.cpp/ollama
+        setups): there's no tool call to gate on, so the plain-text reply is
+        treated as the code directly, compile-checked, and - on failure - fed
+        back with the exact error for a retry, within the same round budget
+        used by the tool-calling path. Returns (final_code, raw_answer_full,
+        reasoning_content, usage_record, messages_sent)."""
+        combined_usage = {}
+        last_content_text = ""
+        last_reasoning = ""
+
+        for round_idx in range(MAX_TOOL_ROUNDS + 1):
+            kwargs = {"model": self.model_name, "messages": working_messages}
+            if getattr(self.model, "reasoning_effort_supported", True) and self.thinking_effort in ["low", "medium", "high"]:
+                kwargs["reasoning_effort"] = self.thinking_effort
+
+            response = self.llm_client.chat.completions.create(**kwargs)
+            message = response.choices[0].message
+
+            usage_record = {}
+            if hasattr(response, "usage") and response.usage:
+                usage_record = self._record_token_usage(response.usage, source="turn")
+                merge_token_usage(turn_token_usage, usage_record)
+                merge_token_usage(combined_usage, usage_record)
+
+            provider_reasoning = extract_provider_reasoning(message)
+            content_text = (message.content or "").strip()
+            inline_reasoning, cleaned_content = extract_reasoning_and_answer(content_text)
+            round_reasoning = "\n\n".join(part for part in [provider_reasoning, inline_reasoning] if part)
+            last_content_text = content_text
+            last_reasoning = round_reasoning
+
+            code = _extract_policy_code(cleaned_content)
+            compile_error = _check_compiles(code) if code.strip() else "empty response"
+            print(f"> [Agent {agent_label} answer]\n{code}")
+            if round_reasoning:
+                print(f"> [Agent {agent_label} reasoning] {round_reasoning}")
+
+            if compile_error is None:
+                return code, last_content_text, last_reasoning, combined_usage, working_messages
+
+            print(f"> [Agent {agent_label}] [round {round_idx + 1}] not valid Python ({compile_error}); asking again with that fed back...")
+            working_messages = working_messages + [
+                {"role": "assistant", "content": message.content},
+                {"role": "user", "content": (
+                    f"Your previous answer for this turn was NOT valid, directly-executable Python - "
+                    f"it failed to compile: {compile_error}\n"
+                    f"Your entire reply must be nothing but Python code (plus an optional single leading "
+                    f"'# ' comment) - no prose, no tags, no markdown fences. Try again for the same turn below."
+                )},
+            ]
+
+        return "", last_content_text, last_reasoning, combined_usage, working_messages
+
+    def _run_policy_debug_loop(self, working_messages, state, turn_token_usage, agent_label):
+        """Runs the write-code -> optionally dry-run via test_policy_code ->
+        commit via submit_policy_code flow for one attempt. The model is never
+        trusted to hand back a direction directly in plain text: the only way
+        to act is the submit_policy_code tool call, and it's only accepted
+        once its code actually compiles - a syntax error comes back as a tool
+        result and the model must call it again. Returns (final_code,
+        raw_answer_full, reasoning_content, usage_record, messages_sent).
+
+        Falls back to _run_policy_plain_loop for providers that don't
+        reliably support tool calling."""
+        if not getattr(self.model, "json_response_format_supported", True):
+            return self._run_policy_plain_loop(working_messages, state, turn_token_usage, agent_label)
+
+        combined_usage = {}
+        last_content_text = ""
+        last_reasoning = ""
+
+        for round_idx in range(MAX_TOOL_ROUNDS + 1):
+            kwargs = {"model": self.model_name, "messages": working_messages, "tools": [POLICY_TOOL_SCHEMA, SUBMIT_POLICY_TOOL_SCHEMA]}
+            if getattr(self.model, "reasoning_effort_supported", True) and self.thinking_effort in ["low", "medium", "high"]:
+                kwargs["reasoning_effort"] = self.thinking_effort
+
+            response = self.llm_client.chat.completions.create(**kwargs)
+            message = response.choices[0].message
+
+            usage_record = {}
+            if hasattr(response, "usage") and response.usage:
+                usage_record = self._record_token_usage(response.usage, source="turn")
+                merge_token_usage(turn_token_usage, usage_record)
+                merge_token_usage(combined_usage, usage_record)
+
+            provider_reasoning = extract_provider_reasoning(message)
+            content_text = (message.content or "").strip()
+            inline_reasoning, _cleaned_content = extract_reasoning_and_answer(content_text)
+            round_reasoning = "\n\n".join(part for part in [provider_reasoning, inline_reasoning] if part)
+            last_content_text = content_text
+            last_reasoning = round_reasoning
+
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                # No tool call at all - plain text is never accepted as the
+                # decision, so nudge the model to actually submit and use up
+                # a round.
+                print(f"> [Agent {agent_label}] [round {round_idx + 1}] no tool call (ignoring plain text); reminding model to submit_policy_code...")
+                if round_reasoning:
+                    print(f"> [Agent {agent_label} reasoning] {round_reasoning}")
+                working_messages = working_messages + [
+                    {"role": "assistant", "content": message.content},
+                    {"role": "user", "content": (
+                        "That was plain text, which is ignored - you must call the "
+                        "submit_policy_code tool with your final code to act this turn "
+                        "(or test_policy_code first if you want to dry-run a draft)."
+                    )},
+                ]
+                continue
+
+            print(f"> [Agent {agent_label}] [round {round_idx + 1}] {len(tool_calls)} tool call(s)...")
+            if round_reasoning:
+                print(f"> [Agent {agent_label} reasoning] {round_reasoning}")
+            working_messages = working_messages + [{
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            }]
+
+            accepted_code = None
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                code = _extract_policy_code(str(args.get("code", "")))
+
+                if tc.function.name == "submit_policy_code":
+                    compile_error = _check_compiles(code)
+                    if compile_error is None:
+                        result = {"accepted": True}
+                        if accepted_code is None:
+                            accepted_code = code
+                    else:
+                        result = {"accepted": False, "error": f"NOT accepted - {compile_error}. Fix it and call submit_policy_code again."}
+                    print(f"> [Agent {agent_label}]   submit -> {result}")
+                else:
+                    result = run_policy_code(code, state, timeout=10)
+                    print(f"> [Agent {agent_label}]   test -> {result}")
+
+                working_messages = working_messages + [{
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result),
+                }]
+
+            if accepted_code is not None:
+                print(f"> [Agent {agent_label} answer]\n{accepted_code}")
+                return accepted_code, last_content_text, last_reasoning, combined_usage, working_messages
+
+        return "", last_content_text, last_reasoning, combined_usage, working_messages
+
+    def step(self):
+        """
+        The core action loop executed every simulation step.
+        The agent perceives the environment, writes policy code, and moves -
+        or, if an auto_move() plan from an earlier turn is still active,
+        keeps running it without calling the LLM (see _run_active_auto_move).
+        """
+        if self.is_done:
+            return
+
+        self.turns += 1
+        decision_start_pos = self.pos
+
+        target = getattr(self.model, 'target_pos', (-1, -1))
+
+        if self.pos == target:
+            print(f"\n[FOUND] [Agent {self.unique_id} - {self.model_name}] has found the Target 'F'!!!")
+            self.is_done = True
+            return
+
+        standing_on = self._tile_symbol_at(self.pos) or '.'
+        pre_move_events = self._apply_tile_interactions()
+        if pre_move_events:
+            standing_on = self._tile_symbol_at(self.pos) or '.'
+
+        # --- Map Sharing Processing ---
+        for other in self.model.agents:
+            if other != self and other.map_share_radius > 0:
+                ox, oy = other.pos
+                for (kx, ky), tile in other.known_map.items():
+                    dist = max(abs(kx - ox), abs(ky - oy))
+                    if dist <= other.map_share_radius:
+                        self.known_map[(kx, ky)] = tile
+
+        surroundings, visible_agents = self.get_surroundings()
+
+        x, y = self.pos
+
+        # Update landmarks from known_map
+        for (kx, ky), val in self.known_map.items():
+            if val not in ['.', '#', '@', ' '] and not val.isdigit():
+                self.landmarks[val] = [kx, ky]
+
+        # Track exploration frontiers: known open/symbol tiles adjacent to unknown space.
+        frontier_candidates = []
+        for (kx, ky), val in self.known_map.items():
+            if val == '#':
+                continue
+            if (kx, ky) in self.blocked_positions:
+                continue
+            for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                neighbor = (kx + dx, ky + dy)
+                if neighbor not in self.known_map:
+                    dist = abs(kx - x) + abs(ky - y)
+                    frontier_candidates.append((dist, kx, ky))
+                    break
+        frontier_candidates.sort()
+        self.frontier_memory = [[kx, ky] for _, kx, ky in frontier_candidates[:12]]
+
+        agent_label = self.model._agent_label(self) if hasattr(self.model, "_agent_label") else str(self.unique_id)
+
+        # --- Auto-move fast path: skip the LLM entirely if a plan is active
+        # and still valid this turn. ---
+        if self._run_active_auto_move(agent_label, decision_start_pos, standing_on, visible_agents, pre_move_events):
+            return
+
+        ascii_map = self.get_memory_map(visible_agents)
+        inbox_snapshot = list(self.inbox)
+        self.inbox.clear()
+
+        if not self.messages:
+            system_prompt = self._build_system_prompt()
+            if self.optimization_mode:
+                self._remember_optimization_base_prompt()
+                system_prompt += f"\n[Optimization Mode Active]\nGuidelines: {self.prompt_addition}\n"
+            self.messages.append({"role": "system", "content": system_prompt})
+
+        # --- Coordination nudge: communication is optional every turn, but a
+        # persistently silent agent that is also stuck or being messaged gets
+        # a nudge instead of being allowed to just never communicate.
+        coordination_hint = ""
+        if self.consecutive_blocked_turns >= 2 and self.turns_since_broadcast >= 3:
+            coordination_hint = (
+                f"You have been blocked for {self.consecutive_blocked_turns} turns in a row and haven't "
+                f"broadcast anything in {self.turns_since_broadcast} turns - consider whether telling your "
+                f"partner would help them unblock you."
+            )
+        elif inbox_snapshot and self.turns_since_broadcast >= 3:
+            coordination_hint = (
+                f"Your partner has messaged you but you haven't broadcast anything in "
+                f"{self.turns_since_broadcast} turns - consider whether a reply would help coordination."
+            )
+
+        state = self._build_perception_state(standing_on, visible_agents, coordination_hint)
+        state["inbox"] = inbox_snapshot
+
+        user_prompt = (
+            f"=== TURN {self.turns} ===\n"
+            f"Memory map (@ = you):\n{ascii_map}\n\n"
+            f"state = {json.dumps(state, ensure_ascii=False)}\n\n"
+            f"Call submit_policy_code with your policy code now (or call test_policy_code first to debug)."
+        )
+
+        turn_token_usage = dict(ZERO_TOKEN_USAGE)
+
+        pairs = self.messages[1:]
+        if len(pairs) > MAX_MESSAGE_HISTORY_TURNS * 2:
+            pairs = pairs[-(MAX_MESSAGE_HISTORY_TURNS * 2):]
+        # Shrinks (dropping the oldest turns first) only if the model's context
+        # window turns out to be too small for the full history.
+        history_limit = len(pairs)
+
+        final_code = ""
+        raw_answer_full = ""
+        reasoning_content = ""
+        give_up_reason = ""
+
+        for attempt in range(3):
+            history_slice = pairs[-history_limit:] if history_limit > 0 else []
+            working_messages = [self.messages[0]] + history_slice + [{"role": "user", "content": user_prompt}]
+            try:
+                final_code, raw_answer_full, reasoning_content, usage_record, messages_sent = self._run_policy_debug_loop(
+                    working_messages, state, turn_token_usage, agent_label
+                )
+
+                if hasattr(self.model, "log_llm_io") and (final_code or raw_answer_full):
+                    self.model.log_llm_io({
+                        "agent": agent_label,
+                        "agent_id": str(self.unique_id),
+                        "model": self.model_name,
+                        "provider": getattr(self.model, "provider", ""),
+                        "turn": self.turns,
+                        "attempt": attempt + 1,
+                        "messages_sent": messages_sent,
+                        "raw_response": raw_answer_full,
+                        "reasoning_content": reasoning_content,
+                        "cleaned_response": final_code,
+                        "token_usage": usage_record,
+                    })
+
+                # _run_policy_debug_loop only ever returns code that already
+                # compiled (accepted via submit_policy_code) or "" (gave up
+                # after MAX_TOOL_ROUNDS without an accepted submission) - no
+                # separate compile retry needed here.
+                if final_code.strip():
+                    break
+                print(f"> [Agent {self.unique_id}] [WARNING] No accepted policy code this attempt. Retrying... ({attempt + 1}/3)")
+            except APIStatusError as e:
+                if is_context_overflow_error(e) and history_limit > 0 and attempt < 2:
+                    history_limit = max(0, history_limit - 2)  # drop the oldest user/assistant turn
+                    print(f"> [Agent {self.unique_id}] [WARNING] Prompt too long for the model's context window; dropping older turns (keeping last {history_limit}) and retrying...")
+                    continue
+                print(f"> [Agent {self.unique_id}] Communication Error: {e}")
+                if attempt == 2:
+                    give_up_reason = f"Communication error after 3 attempts: {e}"
+            except Exception as e:
+                print(f"> [Agent {self.unique_id}] Communication Error: {e}")
+                if attempt == 2:
+                    give_up_reason = f"Communication error after 3 attempts: {e}"
+
+        if not final_code.strip():
+            # No usable policy after 3 attempts. Rather than defaulting to an
+            # arbitrary direction the model never chose, the agent just
+            # doesn't move this turn - but the failure is still recorded
+            # (not a silent return) so it's visible in the GUI/logs.
+            give_up_reason = give_up_reason or "LLM did not produce valid policy code after 3 attempts."
+            print(f"> [Agent {self.unique_id}] [WARNING] {give_up_reason} Agent will not move this turn.")
+            policy_result = {"action": None, "blocks": 1, "broadcast": None, "until": None, "error": give_up_reason}
+        else:
+            policy_result = run_policy_code(final_code, state, timeout=15)
+            if policy_result.get("error"):
+                print(f"> [Agent {self.unique_id}] [WARNING] policy code error on final submission: {policy_result['error']}; agent will not move this turn.")
+
+        reason = ""
+        code_lines = final_code.splitlines()
+        if code_lines and code_lines[0].strip().startswith("#"):
+            reason = code_lines[0].strip().lstrip("#").strip()
+
+        action = str(policy_result.get("action") or "").upper()
+        new_msg = str(policy_result.get("broadcast") or "").strip()
+        until_expr = policy_result.get("until") if not policy_result.get("error") else None
+
+        message_meaning = ""
+        if new_msg:
+            self.turns_since_broadcast = 0
+            sender_label = agent_label
+            recipients = []
+            for other in self.model.agents:
+                if other != self:
+                    other_label = self.model._agent_label(other) if hasattr(self.model, "_agent_label") else str(other.unique_id)
+                    recipients.append(other_label)
+                    other.inbox.append(f"Agent {sender_label}: {new_msg}")
+            if hasattr(self.model, "communication_log"):
+                self.model.communication_log.append({
+                    "model_step": len(self.model.communication_log) + 1,
+                    "agent_turn": self.turns,
+                    "from": sender_label,
+                    "to": recipients,
+                    "message": new_msg,
+                    "position": list(self.pos),
+                    "reason": reason,
+                })
+        else:
+            self.turns_since_broadcast += 1
+
+        log_msg = f"\n--- [Agent {self.unique_id} Turn] ---\n"
+        log_msg += f"Model: {self.model_name}\n"
+        log_msg += f"Position: {self.pos}\n"
+        log_msg += f"Reasoning: {reason}\n"
+        log_msg += f"Action: {action}\n"
+        log_msg += f"Token Usage: {json.dumps(turn_token_usage)}\n"
+        if new_msg:
+            log_msg += f"Broadcast: {new_msg}\n"
+        if until_expr:
+            log_msg += f"Auto-move plan: {action} until '{until_expr}'\n"
+        if policy_result.get("error"):
+            log_msg += f"Policy Error: {policy_result['error']}\n"
+        self.model.log(log_msg)
+
+        print(f"\n>>> Model Step: Agent {self.unique_id} ({self.model_name})")
+        if new_msg:
+            print(f"[BROADCAST]: \"{new_msg}\"")
+        print(f"[POS] Position: {self.pos}")
+        print(f"[THINK] Reasoning: {reason}")
+        print(f"[ACTION] Action: {action}" + (f" (auto-move until '{until_expr}')" if until_expr else ""))
+        print("-" * 30)
+
+        self.messages.append({"role": "user", "content": user_prompt})
+        self.messages.append({"role": "assistant", "content": final_code})
+
+        try:
+            blocks = int(policy_result.get("blocks", 1))
+        except (TypeError, ValueError):
+            blocks = 1
+        blocks = max(1, min(blocks, self.speed_limit))
+
+        interaction_events, blocked_feedback = self._apply_movement(action, blocks, decision_start_pos)
+
+        # A plan only survives into future turns if this move actually
+        # succeeded and there was no error - a blocked or failed first move
+        # means the condition never even gets a chance to matter.
+        if until_expr and self.pos != decision_start_pos:
+            self.active_auto_move = {"direction": action, "blocks": blocks, "until": until_expr}
+        else:
+            self.active_auto_move = None
+
+        no_action_reason = policy_result.get("error") if action not in DIRECTION_DELTAS else ""
 
         self.last_decision = {
             "turn": self.turns,
             "reason": reason,
             "action": action,
             "blocks": blocks,
-            "notes": new_notes,
+            "notes": "",
             "broadcast_message": new_msg,
-            "broadcast_meaning": message_meaning if new_msg else "",
-            "raw_response": raw_answer_full or raw_answer,
+            "broadcast_meaning": message_meaning,
+            "raw_response": raw_answer_full or final_code,
             "reasoning_content": reasoning_content,
+            "policy_code": final_code,
+            "policy_error": policy_result.get("error"),
+            "auto_move": False,
+            "auto_move_until": until_expr,
+            "no_action_reason": no_action_reason,
             "token_usage": turn_token_usage,
             "cumulative_token_usage": {
                 "prompt_tokens": self.prompt_tokens,
@@ -519,8 +693,8 @@ class AgentStepMixin:
             },
             "start_position": list(decision_start_pos),
             "end_position": list(self.pos),
-            "blocked": new_pos == decision_start_pos,
-            "blocked_reason": blocked_feedback,
+            "blocked": self.pos == decision_start_pos,
+            "blocked_reason": blocked_feedback or no_action_reason,
             "interactions": pre_move_events + interaction_events,
-            "inventory": list(self.structured_memory["inventory"])
+            "inventory": list(self.inventory),
         }

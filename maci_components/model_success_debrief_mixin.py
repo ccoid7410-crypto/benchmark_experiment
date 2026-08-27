@@ -22,10 +22,9 @@ class ModelSuccessDebriefMixin:
                     "model": getattr(agent, "model_name", ""),
                     "position": list(agent.pos),
                     "done": bool(getattr(agent, "is_done", False)),
-                    "inventory": list(getattr(agent, "structured_memory", {}).get("inventory", [])),
-                    "memory": getattr(agent, "memory", ""),
+                    "inventory": list(getattr(agent, "inventory", [])),
                     "recent_path": getattr(agent, "action_history", [])[-10:],
-                    "landmarks": getattr(agent, "structured_memory", {}).get("landmarks", {})
+                    "landmarks": getattr(agent, "landmarks", {})
                 }
                 for agent in self.agents
             ]

@@ -450,15 +450,6 @@ def save_turn_snapshot(model, map_generator, step_count, run_dir, group_name="Ex
                 for i, agent in enumerate(getattr(model, "agents", []))
             ],
             "token_usage": token_summary,
-            "allowed_broadcast_codes": getattr(model, "allowed_broadcast_codes", []),
-            "symbol_space": [
-                {
-                    "agent": chr(65 + i),
-                    "communication_space": getattr(agent, "structured_memory", {}).get("communication_space", {}),
-                    "symbol_space_notes": getattr(agent, "structured_memory", {}).get("symbol_space_notes", "")
-                }
-                for i, agent in enumerate(getattr(model, "agents", []))
-            ],
             "success_debrief": getattr(model, "success_debrief", {}),
             "llm_io_log_path": getattr(model, "llm_io_log_path", ""),
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
